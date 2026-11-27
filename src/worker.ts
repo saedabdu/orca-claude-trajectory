@@ -265,6 +265,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     reveal = null
     const wantWs = shown?.workspaceId ?? (typeof want.workspaceId === 'string' && want.workspaceId.length <= 1024 ? want.workspaceId : null)
     const wantSession = shown?.sessionId ?? (typeof want.sessionId === 'string' && SESSION_ID.test(want.sessionId) ? want.sessionId : null)
+    // The call whose row is shown is kept past the answer's limits. It is only compared with call ids.
+    const keepCall = shown?.callId ?? (typeof want.keep === 'string' && want.keep.length <= 128 ? want.keep : null)
     const home = claudeHome()
 
     const all = await localWorkspaces(orca)
@@ -296,7 +298,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const agentCalls = new Set<string>()
       for (const r of records) if (r.k === 'asst') for (const t of r.tools) if (isAgentTool(t.tool)) agentCalls.add(t.id)
       const subagents = agentCalls.size ? await readSubagents(root, session.dir, session.id, agentCalls) : []
-      data = build(records, subagents, complete, Date.now(), before)
+      data = build(records, subagents, complete, Date.now(), before, keepCall)
     } catch (err) {
       cache.clear()
       orca.log(`could not read session ${session.id}: ${err instanceof Error ? err.message : String(err)}`)

@@ -68,11 +68,21 @@ const revealing = atom<string | null>('revealing', null)
 
 let seq = 0
 
+// The call whose row is to stay in the answers: the one being revealed, or
+// the selected call or subcall. The answer keeps it however many came after.
+function shownCall(): string | null {
+  const key = read(revealing) ? `c${read(revealing)}` : read(selected)
+  if (key?.startsWith('c')) return key.slice(1)
+  if (key?.startsWith('s')) return key.slice(key.indexOf('/') + 1) || null
+  return null
+}
+
 async function refresh(): Promise<void> {
   const mine = ++seq
   set(loading, true)
   try {
-    const got = await plugin.request('trajectory.get', read(choice), { timeoutMs: 60_000 })
+    const keep = shownCall()
+    const got = await plugin.request('trajectory.get', keep ? { ...read(choice), keep } : read(choice), { timeoutMs: 60_000 })
     if (mine !== seq) {
       // The worker hands a reveal out once: one that lost a race is asked for again by its ids.
       if (got.reveal) {

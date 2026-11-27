@@ -101,7 +101,12 @@ declare module 'orca' {
   interface PluginRequests {
     /** The trajectory of one Claude Code session; omitted ids pick the focused workspace and its newest session. */
     'trajectory.get': {
-      input: { workspaceId?: string | null; sessionId?: string | null }
+      input: {
+        workspaceId?: string | null
+        sessionId?: string | null
+        /** A call whose row the panel shows: the answer keeps it, past its limits. */
+        keep?: string | null
+      }
       output: TrajectoryAnswer
     }
   }

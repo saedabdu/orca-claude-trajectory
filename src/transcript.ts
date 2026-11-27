@@ -434,6 +434,14 @@ function subCalls(sa: Subagent, by: string | null): SubCall[] {
   return [...calls.values()]
 }
 
+// The newest `n` of a list kept oldest first. The one `kept` picks stays, in
+// place of the oldest of those, when it is older: the panel shows that row.
+function newest<T>(all: readonly T[], n: number, kept: ((x: T) => boolean) | null): T[] {
+  const k = kept ? all.findIndex(kept) : -1
+  if (k < 0 || k >= all.length - n) return all.slice(-n)
+  return [all[k], ...all.slice(all.length - (n - 1))]
+}
+
 // The Agent call in the main loop an agent's work hangs under: its own, or
 // the one that led to it when another subagent started it.
 function ownerCall(sa: Subagent, calls: ReadonlyMap<string, Call>, startedBy: ReadonlyMap<string, string>): Call | null {
@@ -557,7 +565,11 @@ export function tallyTurns(records: readonly Rec[], tally: TurnTally): void {
  * overhead); `now` decides what is still under way; `before` tallies the turns
  * in any records before these.
  */
-export function build(records: readonly Rec[], subagents: readonly Subagent[], complete: boolean, now = Date.now(), before: TurnTally = { n: 0, open: false }): Trajectory {
+/**
+ * `keepCall` is a call the panel shows, its own row or a subcall: it stays in
+ * the answer, and so does the request it hangs under, past the limits.
+ */
+export function build(records: readonly Rec[], subagents: readonly Subagent[], complete: boolean, now = Date.now(), before: TurnTally = { n: 0, open: false }, keepCall: string | null = null): Trajectory {
   const turns: Turn[] = []
   const steps: StepW[] = []
   const calls = new Map<string, Call>()
@@ -702,7 +714,10 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
     if (sa.agentType && sa.toolUseId === c.id) c.agentType = sa.agentType
   }
   // A transcript can repeat an id: each call once, or the rows can't be told apart.
-  for (const c of owners) c.sub = [...new Map(c.sub.map((sc) => [sc.id, sc])).values()].sort((a, b) => a.at - b.at).slice(-LIMITS.subcalls)
+  // The newest are kept, and the one shown: a nested agent's start can be
+  // older than the newest of its parent's calls while it still runs.
+  const isKept = keepCall ? (sc: SubCall) => sc.id === keepCall : null
+  for (const c of owners) c.sub = newest([...new Map(c.sub.map((sc) => [sc.id, sc])).values()].sort((a, b) => a.at - b.at), LIMITS.subcalls, isKept)
 
   // An Agent call with no end in the session's file: its subagent's meta file
   // says when it finished, and one silent for LIVE_MS has no news. A session
@@ -742,7 +757,9 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
   }
 
   // Keep the newest steps, and the turns they belong to (plus a prompt waiting on its first reply).
-  const keep = new Set(steps.slice(-LIMITS.steps))
+  // The step holding the call shown stays too, in place of the oldest of them.
+  const holds = keepCall ? (s: StepW) => s.calls.some((c) => c.id === keepCall || c.sub.some((sc) => sc.id === keepCall)) : null
+  const keep = new Set(newest(steps, LIMITS.steps, holds))
   const lastTurn = turns.at(-1)
   // Numbered before any are left out, so a turn keeps its number as the session grows.
   // A prompt that sent no request (a local command, say) is not a turn.

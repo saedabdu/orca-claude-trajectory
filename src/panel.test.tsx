@@ -6,7 +6,7 @@ import * as panel from './panel.tsx'
 import * as main from './worker.ts'
 import { cutCells } from './format.ts'
 import { projectDirName } from './locate.ts'
-import { build, parseLines } from './transcript.ts'
+import { build, LIMITS, parseLines } from './transcript.ts'
 import { assistant, backgroundLaunch, backgroundSession, basicSession, jsonl, prompt, subagentMeta, T0, toolUse, withShape } from './fixtures.ts'
 import type { TrajectoryAnswer } from './protocol.ts'
 
@@ -295,7 +295,8 @@ test('a press while the panel was closed lands there when it opens', async () =>
 
 // From the press to the drawn row, through the real worker: the running agent
 // started last was started by another subagent, so it has no row of its own.
-test('the status bar’s press on a nested subagent opens the row it sits under, the nested one selected', async () => {
+// `later` is how many calls the outer subagent made after starting it.
+async function pressNested(later: number): Promise<void> {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'traj-home-')))
   const work = realpathSync(mkdtempSync(join(tmpdir(), 'traj-ws-')))
   const saved = process.env.CLAUDE_CONFIG_DIR
@@ -310,7 +311,8 @@ test('the status bar’s press on a nested subagent opens the row it sits under,
     writeFileSync(join(sub, 'agent-a1b2c3.meta.json'), JSON.stringify(subagentMeta('toolu_bg', 'Map the parser')))
     writeFileSync(join(sub, 'agent-a1b2c3.jsonl'), side([
       assistant(3000, 'inner-request', [toolUse('toolu_inner', 'Agent', { description: 'Map the lexer', subagent_type: 'Explore', run_in_background: true })], undefined, 'tool_use'),
-      backgroundLaunch(3200, 'toolu_inner', 'd4e5f6')
+      backgroundLaunch(3200, 'toolu_inner', 'd4e5f6'),
+      ...Array.from({ length: later }, (_, i) => assistant(4000 + i * 100, `later-${i}`, [toolUse(`toolu_later_${i}`, 'Read', { file_path: 'parser.ts' })], undefined, 'tool_use'))
     ]))
     writeFileSync(join(sub, 'agent-d4e5f6.meta.json'), JSON.stringify(subagentMeta('toolu_inner', 'Map the lexer')))
     writeFileSync(join(sub, 'agent-d4e5f6.jsonl'), side([]))
@@ -331,9 +333,19 @@ test('the status bar’s press on a nested subagent opens the row it sits under,
     await worker.command('showRunningSubagent')
     await view.post('trajectory.reveal', { sessionId: S1 })
     await view.settled()
-    assert.ok(view.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
-    assert.equal(view.valueOf({ label: 'Trajectory rows' }), 'stoolu_bg/toolu_inner')
-    assert.ok(drawn('TOOL  Agent'))
+    const shows = (): void => {
+      assert.ok(view!.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
+      assert.equal(view!.valueOf({ label: 'Trajectory rows' }), 'stoolu_bg/toolu_inner')
+      assert.ok(drawn('TOOL  Agent'))
+      // The row it sits under keeps to the subcall limit.
+      const subs = JSON.stringify(view!.tree()).match(/"key":"stoolu_bg\//g) ?? []
+      assert.equal(subs.length, Math.min(1 + later, LIMITS.subcalls))
+    }
+    shows()
+    // The session goes on changing: the next answer still holds the selected row.
+    await view.post('trajectory.changed', { sessionId: S1 })
+    await view.settled()
+    shows()
     assert.deepEqual(view.errors, [])
     assert.deepEqual(view.refusals, [])
   } finally {
@@ -343,7 +355,11 @@ test('the status bar’s press on a nested subagent opens the row it sits under,
     rmSync(home, { recursive: true, force: true })
     rmSync(work, { recursive: true, force: true })
   }
-})
+}
+
+test('the status bar’s press on a nested subagent opens the row it sits under, the nested one selected', () => pressNested(0))
+
+test('a nested subagent pressed after its parent made more calls than the row lists is still shown and selected', () => pressNested(LIMITS.subcalls))
 
 const options = (): string[] => (view!.find({ label: 'Workspace' })!.props.options as { label: string }[]).map((o) => o.label)
 

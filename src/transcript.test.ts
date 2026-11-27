@@ -247,6 +247,33 @@ test('an agent another subagent started hangs under the first Agent call', () =>
   assert.equal(top.agentType, 'Explore')
 })
 
+test('a shown subcall stays under its Agent call past the subcall limit, in place of the oldest', () => {
+  const lines = [prompt(0, 'go'), assistant(20, 'r1', [toolUse('toolu_top', 'Agent', { description: 'top' })])]
+  const records = parseLines(jsonl([
+    assistant(100, 'a1', [toolUse('toolu_inner', 'Agent', { description: 'inner', run_in_background: true })], undefined, 'tool_use'),
+    ...Array.from({ length: LIMITS.subcalls }, (_, i) => assistant(200 + i, `a${i + 2}`, [toolUse(`toolu_later_${i}`, 'Read', { file_path: '/a' })], undefined, 'tool_use'))
+  ]), { sidechain: true })
+  const subagents = [{ toolUseId: 'toolu_inner', agentType: 'Plan', records: [] }, { toolUseId: 'toolu_top', agentType: 'Explore', records }]
+  const later = Array.from({ length: LIMITS.subcalls }, (_, i) => `toolu_later_${i}`)
+  const subOf = (keep: string | null) => build(parseLines(jsonl(lines)), subagents, true, LATER, undefined, keep).turns[0].steps[0].calls[0].sub.map((c) => c.id)
+  assert.deepEqual(subOf(null), later)
+  assert.deepEqual(subOf('toolu_inner'), ['toolu_inner', ...later.slice(1)])
+  // One the newest already hold changes nothing.
+  assert.deepEqual(subOf('toolu_later_5'), later)
+})
+
+test('the request holding a shown call stays past the request limit, in place of the oldest', () => {
+  const lines: unknown[] = [prompt(0, 'loop'), assistant(5, 'r-old', [toolUse('toolu_old', 'Read', { file_path: '/a' })], undefined, 'tool_use')]
+  for (let i = 0; i < LIMITS.steps + 10; i++) lines.push(assistant(10 + i, `r${i}`, [{ type: 'text', text: `step ${i}` }]))
+  const stepsOf = (keep: string | null) => build(parseLines(jsonl(lines)), [], true, LATER, undefined, keep).turns.flatMap((x) => x.steps)
+  assert.ok(!stepsOf(null).some((s) => s.calls.some((c) => c.id === 'toolu_old')))
+  const kept = stepsOf('toolu_old')
+  assert.equal(kept.length, LIMITS.steps)
+  assert.equal(kept[0].calls[0]?.id, 'toolu_old')
+  assert.equal(kept[1].text, 'step 11')
+  assert.equal(kept.at(-1)!.text, `step ${LIMITS.steps + 9}`)
+})
+
 test('a repeated tool id gives one sub-call', () => {
   const lines = [prompt(0, 'go'), assistant(20, 'r1', [toolUse('toolu_top', 'Agent', { description: 'top' })])]
   const records = parseLines(jsonl([assistant(100, 'a1', [toolUse('toolu_same', 'Read', { file_path: '/a' })], undefined, 'tool_use')]), { sidechain: true })
