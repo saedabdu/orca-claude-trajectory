@@ -17,6 +17,18 @@ An [Orca](https://github.com/stablyai/orca) sidebar panel that shows what a [Cla
 
 It follows the session live: the panel updates as the transcript grows.
 
+## Subagents in the status bar
+
+While a subagent runs in any Claude Code session on this machine that Orca knows, the status bar says so: **2 subagents running**, or **3 subagents running · 2 sessions**. Hover it for each one by workspace, with its type, what it was asked and how long it has run. Click it and the panel switches to that session with the subagent's row open; when the panel is closed, it lands there the next time you open it. The item is gone when nothing runs. It looks only at the subagents' meta files of sessions written in the last 30 minutes, every 5 seconds, and never reads a whole transcript for it.
+
+## Where each subagent is
+
+An **AGENT** row says where its subagent is: 🟡 running, ✅ done, ❌ failed, or ❔ no news. A background subagent counts as running until Claude Code writes that it stopped, not from the moment it started. No news is a subagent with no end recorded and nothing written for 10 minutes, as when its session was stopped first; it isn't counted as running. While one runs, its clock moves at least every 15 seconds.
+
+## Finding a workspace
+
+The box above the **Workspace** picker narrows it as you type: every word must appear somewhere in a workspace's name, in any order and any case, so `status 181` finds `app-181-feat-subagent-status`. Enter picks the top match. Clear the box for the whole list.
+
 ## Light and dark
 
 The panel follows Orca's theme, light or dark, with nothing to set: Orca draws every control, and the lanes use its tones. The screenshots below show whichever matches your GitHub theme.

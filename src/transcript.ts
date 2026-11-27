@@ -120,7 +120,10 @@ export type Rec =
   | { k: 'ctx'; cat: CtxCat; chars: number; items: Sized[] }
   | { k: 'compact'; ts: number }
   | { k: 'prompt'; ts: number; text: string; chars: number; auto: string | null }
-  | { k: 'result'; ts: number; id: string; isError: boolean; chars: number; lines: string[] }
+  // `launched`: a background Agent call's result, which comes back as it starts, not when it ends.
+  | { k: 'result'; ts: number; id: string; isError: boolean; chars: number; lines: string[]; launched: boolean }
+  // A background task's end, from the notification line Claude Code writes when it stops.
+  | { k: 'end'; ts: number; id: string; ok: boolean }
   | {
       k: 'asst'
       ts: number
@@ -296,7 +299,7 @@ export function slim(line: unknown, sidechain = false): Rec | null {
       const useId = id(b.tool_use_id)
       if (!useId) return null
       const text = resultText(b.content)
-      return { k: 'result', ts, id: useId, isError: b.is_error === true, chars: text.length, lines: firstLines(text) }
+      return { k: 'result', ts, id: useId, isError: b.is_error === true, chars: text.length, lines: firstLines(text), launched: launchedBy(line) }
     }
     if (line.isMeta === true || line.isCompactSummary === true) return null
     const raw = userText(content)
@@ -354,10 +357,30 @@ export function slim(line: unknown, sidechain = false): Rec | null {
   return null
 }
 
-/** Every tool result in a user line: `slim` keeps the first, this the rest. */
+// Whether a result line says its call went on in the background: Claude Code
+// answers a background Agent call at once, with `status: "async_launched"`.
+function launchedBy(line: Obj): boolean {
+  return isObj(line.toolUseResult) && line.toolUseResult.status === 'async_launched'
+}
+
+// A task notification's end: the call it names and whether it completed.
+// Anything but `completed` (failed, killed, …) is a failed end.
+function taskEnd(line: Obj, ts: number): Rec | null {
+  const raw = isObj(line.message) ? userText(line.message.content) : null
+  if (!raw) return null
+  const useId = /<tool-use-id>([A-Za-z0-9_-]{1,128})<\/tool-use-id>/.exec(raw)?.[1]
+  const status = /<status>([A-Za-z_-]{1,40})<\/status>/.exec(raw)?.[1]
+  return useId && status ? { k: 'end', ts, id: useId, ok: status === 'completed' } : null
+}
+
+/** Every tool result in a user line: `slim` keeps the first, this the rest. A task notification adds its end. */
 export function slimAll(line: unknown, sidechain = false): Rec[] {
   const first = slim(line, sidechain)
   if (!first) return []
+  if (first.k === 'prompt' && first.auto === EVENTS['task-notification'] && isObj(line)) {
+    const end = taskEnd(line, first.ts)
+    return end ? [first, end] : [first]
+  }
   if (first.k !== 'result' || !isObj(line)) return [first]
   const message = line.message as Obj
   const out: Rec[] = []
@@ -366,7 +389,8 @@ export function slimAll(line: unknown, sidechain = false): Rec[] {
     const useId = id(b.tool_use_id)
     if (!useId) continue
     const text = resultText(b.content)
-    out.push({ k: 'result', ts: first.ts, id: useId, isError: b.is_error === true, chars: text.length, lines: firstLines(text) })
+    // The line's `toolUseResult` speaks for its first result only.
+    out.push({ k: 'result', ts: first.ts, id: useId, isError: b.is_error === true, chars: text.length, lines: firstLines(text), launched: !out.length && first.launched })
   }
   return out
 }
@@ -389,7 +413,12 @@ export function parseLines(text: string, { sidechain = false, maxLine = 4 * 1024
 
 // ---------------------------------------------------------------- a subagent
 
-export type Subagent = { toolUseId: string; agentType: string | null; records: Rec[] }
+/**
+ * A subagent's records, and what its files say about its end: `finished` is
+ * set in its meta file when it stops, `writtenAt` is when its transcript last
+ * changed. A test or a check can leave both out.
+ */
+export type Subagent = { toolUseId: string; agentType: string | null; records: Rec[]; finished?: boolean; writtenAt?: number | null }
 
 // A subagent's own calls, oldest first. `by` names the agent when its calls sit under another's.
 function subCalls(sa: Subagent, by: string | null): SubCall[] {
@@ -506,7 +535,7 @@ function splitBySize(pieces: Piece[], total: number): void {
   })
 }
 
-const LIVE_MS = 10 * 60_000 // a request with no end this recent is still under way
+const LIVE_MS = 10 * 60_000 // a request with no end this recent is still under way; a subagent silent longer has no news
 
 /** The turns in records that were left out, so those after them keep their numbers. */
 export type TurnTally = { n: number; open: boolean }
@@ -532,6 +561,7 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
   const turns: Turn[] = []
   const steps: StepW[] = []
   const calls = new Map<string, Call>()
+  const launched = new Set<string>() // background Agent calls: their result came as they started
   const reqAt = new Map<string, number>()
   let stepIn: Piece[] = []
   let turn: Turn | null = null
@@ -576,10 +606,17 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
     } else if (r.k === 'result') {
       const c = calls.get(r.id)
       if (c) {
-        Object.assign(c, { ms: Math.max(0, r.ts - c.at), done: true, isError: r.isError, chars: r.chars, lines: r.lines })
+        // A background launch is answered at once: its text goes in the next request, but the call runs on.
+        if (r.launched && isAgentTool(c.tool) && !r.isError) launched.add(c.id)
+        else Object.assign(c, { ms: Math.max(0, r.ts - c.at), done: true, isError: r.isError })
+        Object.assign(c, { chars: r.chars, lines: r.lines })
         stepIn.push({ chars: r.chars, tokens: null, call: c })
       }
       cur = null
+    } else if (r.k === 'end') {
+      const c = calls.get(r.id)
+      if (c && launched.has(c.id) && !c.done) Object.assign(c, { ms: Math.max(0, r.ts - c.at), done: true, isError: !r.ok })
+      continue
     } else if (r.k === 'asst') {
       if (!cur || cur.key !== r.key) {
         const t: Turn = turn ?? earlierTurn(r.ts)
@@ -623,7 +660,7 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
       if (r.text) cur.text = cur.text ? preview(`${cur.text} ${r.text}`, LIMITS.previewChars) : r.text
       for (const t of r.tools) {
         if (calls.has(t.id)) continue
-        const c: Call = { ...t, at: r.ts, ms: null, done: false, isError: false, by: null, lines: [], chars: null, tokens: null, sub: [] }
+        const c: Call = { ...t, at: r.ts, ms: null, done: false, isError: false, quiet: false, by: null, lines: [], chars: null, tokens: null, sub: [] }
         calls.set(t.id, c)
         cur.calls.push(c)
       }
@@ -666,6 +703,19 @@ export function build(records: readonly Rec[], subagents: readonly Subagent[], c
   }
   // A transcript can repeat an id: each call once, or the rows can't be told apart.
   for (const c of owners) c.sub = [...new Map(c.sub.map((sc) => [sc.id, sc])).values()].sort((a, b) => a.at - b.at).slice(-LIMITS.subcalls)
+
+  // An Agent call with no end in the session's file: its subagent's meta file
+  // says when it finished, and one silent for LIVE_MS has no news. A session
+  // stopped before its subagent ended would otherwise show it running forever.
+  const own = new Map(subagents.map((sa) => [sa.toolUseId, sa]))
+  for (const c of calls.values()) {
+    if (c.done || !isAgentTool(c.tool)) continue
+    const sa = own.get(c.id)
+    const lastRec = sa?.records.reduce((n, r) => ('ts' in r ? Math.max(n, r.ts) : n), c.at) ?? c.at
+    const last = Math.max(lastRec, sa?.writtenAt ?? c.at)
+    if (sa?.finished) Object.assign(c, { ms: Math.max(0, lastRec - c.at), done: true })
+    else if (now - last >= LIVE_MS) c.quiet = true
+  }
 
   // What each request carried new, in tokens: its growth over the last one, spread by size.
   let prev: StepW | null = null

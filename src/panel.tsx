@@ -3,7 +3,9 @@
 // and every tool definition), then each turn: your prompt (YOU), each request
 // Claude was sent (CLAUDE), and the tool calls each request made (TOOL, AGENT
 // with its own calls under it). Selecting a row opens its details under the
-// list. Lanes above the rows draw the newest events in order.
+// list. Lanes above the rows draw the newest events in order. An AGENT row
+// says whether its subagent is running, done, failed or silent, and pressing
+// the status bar item opens the running one's row here.
 //
 // A components panel: Orca draws every control itself and the panel has no
 // DOM, so transcript text can only ever appear as text.
@@ -19,6 +21,7 @@ import {
   files,
   Heading,
   IconButton,
+  Input,
   KeyValue,
   on,
   plugin,
@@ -58,6 +61,10 @@ const tabOf = atom<Record<string, string>>('tabs', {})
 const expanded = atom<string[] | null>('expanded', null)
 const showCalls = atom('showCalls', true, { persist: 'plugin' })
 const showSubcalls = atom('showSubcalls', true, { persist: 'plugin' })
+/** What is typed in the search box above the Workspace picker. */
+const wsQuery = atom('wsQuery', '')
+/** An Agent call to open once its session's rows arrive. */
+const revealing = atom<string | null>('revealing', null)
 
 let seq = 0
 
@@ -66,7 +73,15 @@ async function refresh(): Promise<void> {
   set(loading, true)
   try {
     const got = await plugin.request('trajectory.get', read(choice), { timeoutMs: 60_000 })
-    if (mine !== seq) return
+    if (mine !== seq) {
+      // The worker hands a reveal out once: one that lost a race is asked for again by its ids.
+      if (got.reveal) {
+        set(choice, { workspaceId: got.workspaceId, sessionId: got.sessionId })
+        set(revealing, got.reveal)
+        void refresh()
+      }
+      return
+    }
     const was = read(answer)
     if (was && (was.sessionId !== got.sessionId || was.workspaceId !== got.workspaceId)) {
       set(selected, null)
@@ -77,6 +92,8 @@ async function refresh(): Promise<void> {
     }
     set(answer, got)
     set(failure, null)
+    const callId = got.reveal ?? read(revealing)
+    if (callId) reveal(got, callId)
   } catch (err) {
     if (mine !== seq) return
     const code = (err as { code?: string }).code
@@ -86,9 +103,31 @@ async function refresh(): Promise<void> {
   }
 }
 
+// Shows the row of an Agent call: its session stays picked, its turn, request
+// and row open, the row selected so its details show. Calls must be shown for
+// the row to be there.
+function reveal(got: TrajectoryAnswer, callId: string): void {
+  set(revealing, null)
+  set(choice, { workspaceId: got.workspaceId, sessionId: got.sessionId })
+  const t = got.data
+  if (!t) return
+  const keys = turnKeys(t)
+  const sKeys = stepKeys(t)
+  t.turns.forEach((turn, i) => {
+    for (const s of turn.steps) {
+      if (!s.calls.some((c) => c.id === callId)) continue
+      set(showCalls, true)
+      update(expanded, (cur) => [...new Set([...(cur ?? defaultOpen(t)), keys[i], sKeys.get(s)!, `c${callId}`])])
+      set(selected, `c${callId}`)
+    }
+  })
+}
+
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(
     plugin.on('trajectory.changed', () => void refresh()),
+    // The status bar item was pressed: the answer says which session and row.
+    plugin.on('trajectory.reveal', () => void refresh()),
     on('agent.status.changed', () => void refresh()),
     // Fires once as it subscribes, then when focus moves.
     on('workspace.changed', () => {
@@ -136,6 +175,15 @@ const TAG: Record<string, string> = { fixed: 'FIXED', you: 'YOU', claude: 'CLAUD
 // colour a row can carry. Each has emoji presentation by default (no variation
 // selector), so it draws in colour wherever there is a colour emoji font.
 const GLYPH = { fixed: '📚', turn: '🚩', event: '⚡', you: '💬', compact: '📦', claude: '🤖', tool: '🔧', sub: '🔨', agent: '🚀', running: '⏳', error: '❌' } as const
+
+// Where an AGENT row's subagent is, after its tag. The emoji is the colour:
+// amber running, green done, red failed, grey for no news.
+const MARK = { running: '🟡 running', done: '✅ done', failed: '❌ failed', quiet: '❔ no news' } as const
+
+/** Where an Agent call's subagent is: no news is a call with no end that has been silent too long. */
+function agentState(c: Call): keyof typeof MARK {
+  return c.isError ? 'failed' : c.done ? 'done' : c.quiet ? 'quiet' : 'running'
+}
 
 function figures(...parts: (string | null | undefined | false)[]): string | undefined {
   const s = parts.filter(Boolean).join(' · ')
@@ -215,9 +263,12 @@ function rows(t: Trajectory, now: number, opened: readonly string[]): { items: T
           return { key: `s${c.id}/${sc.id}`, label: `${sc.isError ? GLYPH.error : sc.done ? GLYPH.sub : GLYPH.running} ${TAG.sub}  ${sc.tool}${sc.summary ? ` ${sc.summary}` : ''}${sc.isError ? ' ✗' : ''}`, description: figures(sc.done ? took(sc.ms) : took(now - sc.at)) }
         })
         const name = agent ? (c.agentType ?? 'Agent') : c.tool
+        const label = agent
+          ? `${GLYPH.agent} ${TAG.agent}  ${MARK[agentState(c)]}  ${name}${c.summary ? ` · ${c.summary}` : ''}${c.sub.length ? ` · ${plural(c.sub.length, 'call')}` : ''}`
+          : `${c.isError ? GLYPH.error : !c.done ? GLYPH.running : GLYPH.tool} ${TAG.tool}  ${name}${c.summary ? ` ${c.summary}` : ''}${c.isError ? ' ✗' : ''}`
         return {
           key: ck,
-          label: `${c.isError ? GLYPH.error : !c.done ? GLYPH.running : agent ? GLYPH.agent : GLYPH.tool} ${agent ? TAG.agent : TAG.tool}  ${name}${c.summary ? ` ${c.summary}` : ''}${c.isError ? ' ✗' : ''}${c.sub.length ? ` · ${plural(c.sub.length, 'call')}` : ''}`,
+          label,
           description: figures(kTok(c.tokens), c.done ? took(c.ms) : took(now - c.at)),
           children: sub.length ? sub : undefined
         }
@@ -292,7 +343,8 @@ function tabs(key: string, names: string[], body: (tab: string) => OrcaNode) {
 
 const kv = (items: (KeyValueItem | null | false)[]) => <KeyValue items={items.filter(Boolean) as KeyValueItem[]} />
 
-function callStatus(c: SubCall): KeyValueItem {
+function callStatus(c: SubCall | Call): KeyValueItem {
+  if ('quiet' in c && c.quiet && !c.done) return { label: 'Status', value: 'No news: no end recorded, and nothing written for 10 minutes', tone: 'neutral' }
   return { label: 'Status', value: !c.done ? 'Running' : c.isError ? 'Failed' : 'Completed', tone: !c.done ? 'warning' : c.isError ? 'danger' : undefined }
 }
 
@@ -495,6 +547,17 @@ function lanes(t: Trajectory, now: number) {
 
 // ---------------------------------------------------------------- the panel
 
+const PICKER = { workspaces: 400 } // options the Workspace picker draws, after the search
+
+/**
+ * Whether a workspace name matches what was typed: every word of it appears
+ * somewhere in the name, in any order and any case. Nothing typed matches all.
+ */
+function matches(name: string, query: string): boolean {
+  const hay = name.toLowerCase()
+  return query.toLowerCase().split(/\s+/).filter(Boolean).every((word) => hay.includes(word))
+}
+
 const ICON: Record<string, IconName> = { refresh: 'refresh', export: 'download' }
 
 export default function Panel() {
@@ -520,13 +583,28 @@ export default function Panel() {
       </Stack>
     )
   }
+  const query = read(wsQuery)
+  const found = a.workspaces.filter((w) => matches(w.name, query)).slice(0, PICKER.workspaces)
   const pickers = (
     <Stack gap="sm">
+      <Input
+        label="Search workspaces"
+        labelHidden
+        type="search"
+        placeholder="Search workspaces…"
+        value={query}
+        onChange={(v) => set(wsQuery, v)}
+        onSubmit={() => {
+          // Enter picks the top match.
+          const top = read(answer)?.workspaces.find((w) => matches(w.name, read(wsQuery)))
+          if (top) pickWorkspace(top.id)
+        }}
+      />
       <Select
         label="Workspace"
-        value={a.workspaceId ?? undefined}
-        placeholder="Pick a workspace"
-        options={a.workspaces.slice(0, 400).map((w) => ({ value: w.id, label: w.name }))}
+        value={a.workspaceId && found.some((w) => w.id === a.workspaceId) ? a.workspaceId : undefined}
+        placeholder={found.length ? 'Pick a workspace' : 'No workspace matches'}
+        options={found.map((w) => ({ value: w.id, label: w.name }))}
         onChange={pickWorkspace}
       />
       {a.sessions.length ? (

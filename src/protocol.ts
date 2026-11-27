@@ -25,6 +25,8 @@ export type Call = SubCall & {
   /** For an Agent (Task) call: the subagent's type and the calls it made. */
   agentType: string | null
   sub: SubCall[]
+  /** Not done, with no end recorded and nothing written for 10 minutes: no news, not counted as running. */
+  quiet: boolean
 }
 
 export type Step = {
@@ -91,6 +93,8 @@ export type TrajectoryAnswer = {
   data: Trajectory | null
   /** Why there is nothing to show, when there isn't. */
   notice: string | null
+  /** The Agent call whose row to open: the status bar was pressed for this session's running subagent. */
+  reveal?: string | null
 }
 
 declare module 'orca' {
@@ -104,5 +108,7 @@ declare module 'orca' {
   interface PluginPanelEvents {
     /** The watched session's transcript changed: ask again. */
     'trajectory.changed': { sessionId: string }
+    /** The status bar item was pressed: ask again, and the answer says which session and row to show. */
+    'trajectory.reveal': { sessionId: string }
   }
 }

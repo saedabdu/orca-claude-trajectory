@@ -156,3 +156,43 @@ export function showcaseSubagent(): unknown[] {
     toolResult(17_300, 'toolu_e4', 'app.use(json())')
   ]
 }
+
+// ---------------------------------------------------------------- background subagents
+
+/** The result Claude Code writes the moment a background Agent call starts: not its end. */
+export const backgroundLaunch = (ms: number, id: string, agentId: string) => ({
+  type: 'user',
+  timestamp: iso(ms),
+  toolUseResult: { isAsync: true, status: 'async_launched', agentId, description: 'Map the parser', prompt: 'Map the parser.', outputFile: 'agent-output.txt', canReadOutputFile: true },
+  message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: [{ type: 'text', text: `Async agent launched successfully. agentId: ${agentId}` }] }] }
+})
+
+/** The line that says a background task stopped, `status` `completed` or otherwise. */
+export const taskNotification = (ms: number, id: string, status: string) => ({
+  type: 'user',
+  timestamp: iso(ms),
+  origin: { kind: 'task-notification', producer: 'agent' },
+  message: {
+    role: 'user',
+    content: `<task-notification>\n<task-id>task-1</task-id>\n<tool-use-id>${id}</tool-use-id>\n<status>${status}</status>\n<summary>Agent "Map the parser" ${status}</summary>\n<result>Done.</result>\n</task-notification>`
+  }
+})
+
+/** A subagent's meta file: no `finished` while it runs, `finished: true` after. */
+export const subagentMeta = (toolUseId: string, description: string, finished = false) => ({
+  agentType: 'Explore',
+  description,
+  toolUseId,
+  spawnDepth: 1,
+  ...(finished ? { finished: true } : {})
+})
+
+/** A prompt, then a request that starts a background Explore subagent and goes on. */
+export function backgroundSession(): unknown[] {
+  return [
+    prompt(0, 'Map the parser in the background'),
+    assistant(1000, 'r1', [toolUse('toolu_bg', 'Agent', { description: 'Map the parser', subagent_type: 'Explore', prompt: 'Map the parser.', run_in_background: true })], undefined, 'tool_use'),
+    backgroundLaunch(1200, 'toolu_bg', 'a1b2c3'),
+    assistant(2000, 'r2', [{ type: 'text', text: 'It is running; I’ll wait for it.' }])
+  ]
+}

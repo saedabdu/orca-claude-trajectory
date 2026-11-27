@@ -3,6 +3,8 @@ import { build, LIMITS, parseLines, slim, toolSummary } from './transcript.ts'
 import { HIDDEN } from './redact.ts'
 import { apiRequest, assistant, basicSession, iso, jsonl, prompt, T0, toolResult, toolUse } from './fixtures.ts'
 import { attachment, requestShape, withShape } from './fixtures.ts'
+import { backgroundSession, taskNotification } from './fixtures.ts'
+import type { Call } from './protocol.ts'
 
 const LATER = T0 + 24 * 3600_000 // long after: nothing is under way
 
@@ -359,4 +361,50 @@ test('an event nobody typed is not a numbered turn, and none of its text is kept
 test('an event still waiting on its reply draws nothing', () => {
   const t = build(parseLines(jsonl([prompt(0, 'first'), reply(10, 'r1'), prompt(100, '<ci-monitor-event>x</ci-monitor-event>')])), [], true, LATER)
   assert.equal(t.turns.length, 1)
+})
+
+// ---------------------------------------------------------------- a subagent's end
+
+const bgCall = (lines: unknown[], now: number, subagents: Parameters<typeof build>[1] = []): Call =>
+  build(parseLines(jsonl(lines)), subagents, true, T0 + now).turns.flatMap((t) => t.steps).flatMap((s) => s.calls).find((c) => c.id === 'toolu_bg')!
+
+test('a background subagent runs until its notification, then is done', () => {
+  // Its launch result came at once: it is still running a minute in.
+  const running = bgCall(backgroundSession(), 60_000)
+  assert.equal(running.done, false)
+  assert.equal(running.quiet, false)
+  assert.deepEqual(running.lines, ['Async agent launched successfully. agentId: a1b2c3'])
+  // The notification naming its call ends it.
+  const done = bgCall([...backgroundSession(), taskNotification(30_000, 'toolu_bg', 'completed')], 60_000)
+  assert.equal(done.done, true)
+  assert.equal(done.isError, false)
+  assert.equal(done.ms, 30_000 - 1000)
+  // One naming another call leaves it running.
+  assert.equal(bgCall([...backgroundSession(), taskNotification(30_000, 'toolu_other', 'completed')], 60_000).done, false)
+})
+
+test('a failed subagent is told apart from a done one', () => {
+  // A foreground subagent's error result.
+  const fg = build(parseLines(jsonl([
+    prompt(0, 'Map it'),
+    assistant(1000, 'r1', [toolUse('toolu_fg', 'Agent', { description: 'Map it', subagent_type: 'Explore' })], undefined, 'tool_use'),
+    toolResult(5000, 'toolu_fg', 'Agent stopped: out of turns', true)
+  ])), [], true, T0 + 60_000).turns[0].steps[0].calls[0]
+  assert.ok(fg.done && fg.isError)
+  // A background one whose notification is not `completed`.
+  const bg = bgCall([...backgroundSession(), taskNotification(30_000, 'toolu_bg', 'failed')], 60_000)
+  assert.ok(bg.done && bg.isError)
+  // Its meta file saying `finished` ends it too, as done.
+  const meta = bgCall(backgroundSession(), 60_000, [{ toolUseId: 'toolu_bg', agentType: 'Explore', records: [], finished: true, writtenAt: T0 + 20_000 }])
+  assert.ok(meta.done && !meta.isError)
+})
+
+test('a subagent with no end, silent for 10 minutes, has no news', () => {
+  const sa = { toolUseId: 'toolu_bg', agentType: 'Explore', records: [], writtenAt: T0 + 2000 }
+  const fresh = bgCall(backgroundSession(), 9 * 60_000, [sa])
+  assert.ok(!fresh.done && !fresh.quiet)
+  const silent = bgCall(backgroundSession(), 2000 + 10 * 60_000, [sa])
+  assert.ok(!silent.done && silent.quiet)
+  // Written to since: running again.
+  assert.equal(bgCall(backgroundSession(), 2000 + 10 * 60_000, [{ ...sa, writtenAt: T0 + 9 * 60_000 }]).quiet, false)
 })

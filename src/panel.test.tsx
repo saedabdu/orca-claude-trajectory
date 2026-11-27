@@ -2,7 +2,7 @@ import { afterEach, assert, mockHost, mount, test, type TestPanel } from 'orca/t
 import * as panel from './panel.tsx'
 import { cutCells } from './format.ts'
 import { build, parseLines } from './transcript.ts'
-import { assistant, basicSession, jsonl, prompt, T0, withShape } from './fixtures.ts'
+import { assistant, backgroundSession, basicSession, jsonl, prompt, T0, withShape } from './fixtures.ts'
 import type { TrajectoryAnswer } from './protocol.ts'
 
 const S1 = '11111111-1111-4111-8111-111111111111'
@@ -232,4 +232,107 @@ test('a selected request stays selected when older records leave', async () => {
   assert.ok(drawn('Request #1'))
   assert.ok(drawn('second reply'))
   assert.deepEqual(view.errors, [])
+})
+
+// ---------------------------------------------------------------- the status bar's row, and search
+
+const S2 = '22222222-2222-4222-8222-222222222222'
+// Two sessions; the second has a background subagent running.
+const twoSessions = (extra: Partial<TrajectoryAnswer> = {}): TrajectoryAnswer =>
+  answer({ sessions: [{ id: S1, title: 'Fix the parser', updatedAt: T0 }, { id: S2, title: 'Map the parser', updatedAt: T0 - 1000 }], ...extra })
+const bgData = () => build(parseLines(jsonl(backgroundSession())), [], true, T0 + 60_000)
+
+test('the status bar’s press shows the session with the subagent’s row open', async () => {
+  let pressed = false
+  const host = mockHost({
+    capabilities: ['workspace:read', 'agent:read'],
+    // As the worker answers: the pressed-for session and row, once, whatever the panel had picked.
+    requests: {
+      'trajectory.get': (input) => {
+        if (!pressed) return twoSessions({ sessionId: (input as { sessionId?: string | null }).sessionId ?? S1 })
+        pressed = false
+        return twoSessions({ sessionId: S2, data: bgData(), reveal: 'toolu_bg' })
+      }
+    }
+  })
+  view = await mount(panel, { host })
+  assert.equal(view.valueOf({ label: 'Session' }), S1)
+  pressed = true
+  await view.post('trajectory.reveal', { sessionId: S2 })
+  assert.equal(view.valueOf({ label: 'Session' }), S2)
+  assert.ok(view.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
+  assert.equal(view.valueOf({ label: 'Trajectory rows' }), 'ctoolu_bg')
+  assert.ok(drawn('🚀 AGENT  🟡 running  Explore · Map the parser'))
+  // It stays on that session when asked again.
+  await view.press({ label: 'Refresh' })
+  assert.equal(view.valueOf({ label: 'Session' }), S2)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.refusals, [])
+})
+
+test('a press while the panel was closed lands there when it opens', async () => {
+  const asked: unknown[] = []
+  const host = mockHost({
+    capabilities: ['workspace:read', 'agent:read'],
+    requests: {
+      'trajectory.get': (input) => {
+        asked.push(input)
+        return asked.length === 1 ? twoSessions({ sessionId: S2, data: bgData(), reveal: 'toolu_bg' }) : twoSessions({ sessionId: (input as { sessionId?: string }).sessionId ?? S1, data: bgData() })
+      }
+    }
+  })
+  view = await mount(panel, { host })
+  await view.settled()
+  assert.equal(view.valueOf({ label: 'Session' }), S2)
+  assert.ok(view.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
+  assert.deepEqual(view.errors, [])
+})
+
+const options = (): string[] => (view!.find({ label: 'Workspace' })!.props.options as { label: string }[]).map((o) => o.label)
+
+test('the search box matches parts of a name, its words in any order', async () => {
+  const names = ['app · main', 'app-181-feat-subagent-status', 'squad-chat · next']
+  const asked: { workspaceId?: string | null }[] = []
+  const host = mockHost({
+    capabilities: ['workspace:read', 'agent:read'],
+    requests: {
+      'trajectory.get': (input) => {
+        asked.push(input as { workspaceId?: string | null })
+        return answer({ workspaces: names.map((name, i) => ({ id: `ws-${i + 1}`, name })) })
+      }
+    }
+  })
+  view = await mount(panel, { host })
+  assert.deepEqual(options(), names)
+  await view.type({ label: 'Search workspaces' }, 'status 181')
+  assert.deepEqual(options(), ['app-181-feat-subagent-status'])
+  await view.type({ label: 'Search workspaces' }, 'STATUS', { replace: true })
+  assert.deepEqual(options(), ['app-181-feat-subagent-status'])
+  await view.type({ label: 'Search workspaces' }, 'zzz', { replace: true })
+  assert.deepEqual(options(), [])
+  await view.type({ label: 'Search workspaces' }, '', { replace: true })
+  assert.deepEqual(options(), names)
+  // Enter picks the top match.
+  await view.type({ label: 'Search workspaces' }, 'chat', { replace: true, submit: true })
+  assert.equal(asked.at(-1)?.workspaceId, 'ws-3')
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+})
+
+test('each AGENT row says where its subagent is', async () => {
+  const lines = backgroundSession()
+  const call = (extra: unknown[], now: number) => answer({ data: build(parseLines(jsonl([...lines, ...extra])), [], true, T0 + now) })
+  const cases: [TrajectoryAnswer, string][] = [
+    [call([], 60_000), '🟡 running'],
+    [call([{ type: 'user', timestamp: new Date(T0 + 9000).toISOString(), message: { role: 'user', content: '<task-notification>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n</task-notification>' } }], 60_000), '✅ done'],
+    [call([{ type: 'user', timestamp: new Date(T0 + 9000).toISOString(), message: { role: 'user', content: '<task-notification>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>killed</status>\n</task-notification>' } }], 60_000), '❌ failed'],
+    [call([], 20 * 60_000), '❔ no news']
+  ]
+  for (const [a, mark] of cases) {
+    view = await mount(panel, { host: hostOf(a) })
+    await view.expand({ label: 'Trajectory rows' }, `r${a.data!.turns[0].steps[0].at}`)
+    assert.ok(drawn(`🚀 AGENT  ${mark}  Explore · Map the parser`), mark)
+    await view.unmount()
+    view = undefined
+  }
 })
