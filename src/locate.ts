@@ -173,11 +173,19 @@ async function sessionHead(file: string, size: number, mtime: number): Promise<{
 }
 
 /**
+ * What a listing reaches past the newest `CAPS.sessions`. `since`: every
+ * session written after that time instead, however many, so the status bar
+ * misses no running subagent. `also`: that session too, wherever it sorts,
+ * so a session the status bar was pressed for still opens when it is older.
+ */
+export type Reach = { since?: number; also?: string | null }
+
+/**
  * A workspace's sessions, newest first. A session is listed only when its
  * transcript says it ran in `cwd`; one too new to say is listed when its
  * folder's name matches exactly (two working directories can share a name).
  */
-export async function listSessions(home: string, cwd: string): Promise<{ root: string; sessions: Found[] }> {
+export async function listSessions(home: string, cwd: string, reach: Reach = {}): Promise<{ root: string; sessions: Found[] }> {
   const found = await projectDirs(home, cwd)
   if (!found) return { root: '', sessions: [] }
   const { root, dirs } = found
@@ -199,13 +207,33 @@ export async function listSessions(home: string, cwd: string): Promise<{ root: s
     }
   }
   candidates.sort((a, b) => b.mtime - a.mtime)
-  const sessions: Found[] = []
-  for (const c of candidates.slice(0, CAPS.sessions * 3)) {
-    if (sessions.length >= CAPS.sessions) break
+  const listed = async (c: (typeof candidates)[number]): Promise<Found | null> => {
     const head = await sessionHead(c.file, c.size, c.mtime)
-    if (!head) continue
-    if (head.cwd ? head.cwd !== cwd && head.cwd !== realCwd : !c.exact) continue
-    sessions.push({ id: c.id, title: head.title ?? 'Untitled session', updatedAt: Math.round(c.mtime), file: c.file, dir: c.dir })
+    if (!head) return null
+    if (head.cwd ? head.cwd !== cwd && head.cwd !== realCwd : !c.exact) return null
+    return { id: c.id, title: head.title ?? 'Untitled session', updatedAt: Math.round(c.mtime), file: c.file, dir: c.dir }
+  }
+  const { since, also } = reach
+  const sessions: Found[] = []
+  if (since != null) {
+    for (const c of candidates) {
+      if (c.mtime <= since) break // newest first: the rest are older
+      const s = await listed(c)
+      if (s) sessions.push(s)
+    }
+  } else {
+    for (const c of candidates.slice(0, CAPS.sessions * 3)) {
+      if (sessions.length >= CAPS.sessions) break
+      const s = await listed(c)
+      if (s) sessions.push(s)
+    }
+  }
+  if (also && !sessions.some((s) => s.id === also)) {
+    const c = candidates.find((x) => x.id === also)
+    const s = c ? await listed(c) : null
+    // In its place by time, so the list stays newest first.
+    const at = s ? sessions.findIndex((x) => x.updatedAt < s.updatedAt) : -1
+    if (s) sessions.splice(at < 0 ? sessions.length : at, 0, s)
   }
   return { root, sessions }
 }

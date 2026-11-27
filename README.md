@@ -19,7 +19,7 @@ It follows the session live: the panel updates as the transcript grows.
 
 ## Subagents in the status bar
 
-While a subagent runs in any Claude Code session on this machine that Orca knows, the status bar says so: **2 subagents running**, or **3 subagents running · 2 sessions**. Hover it for each one by workspace, with its type, what it was asked and how long it has run. Click it and the panel switches to that session with the subagent's row open; when the panel is closed, it lands there the next time you open it. The item is gone when nothing runs. It looks only at the subagents' meta files of sessions written in the last 30 minutes, every 5 seconds, and never reads a whole transcript for it.
+While a subagent runs in any Claude Code session on this machine that Orca knows, the status bar says so: **2 subagents running**, or **3 subagents running · 2 sessions**. Hover it for each one by workspace, with its type, what it was asked and how long it has run: the first 12, then how many more. Click it and the panel switches to that session with the subagent's row open; one that another subagent started opens the row it sits under, with its own call selected. When the panel is closed, it lands there the next time you open it. The item is gone when nothing runs. It looks only at the subagents' meta files of sessions written in the last 30 minutes, every 5 seconds, and never reads a whole transcript for it.
 
 ## Where each subagent is
 

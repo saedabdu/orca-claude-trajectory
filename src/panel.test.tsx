@@ -1,8 +1,13 @@
-import { afterEach, assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
+import { afterEach, assert, mockHost, mount, mountWorker, test, type TestPanel } from 'orca/testing'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as panel from './panel.tsx'
+import * as main from './worker.ts'
 import { cutCells } from './format.ts'
+import { projectDirName } from './locate.ts'
 import { build, parseLines } from './transcript.ts'
-import { assistant, backgroundSession, basicSession, jsonl, prompt, T0, withShape } from './fixtures.ts'
+import { assistant, backgroundLaunch, backgroundSession, basicSession, jsonl, prompt, subagentMeta, T0, toolUse, withShape } from './fixtures.ts'
 import type { TrajectoryAnswer } from './protocol.ts'
 
 const S1 = '11111111-1111-4111-8111-111111111111'
@@ -286,6 +291,58 @@ test('a press while the panel was closed lands there when it opens', async () =>
   assert.equal(view.valueOf({ label: 'Session' }), S2)
   assert.ok(view.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
   assert.deepEqual(view.errors, [])
+})
+
+// From the press to the drawn row, through the real worker: the running agent
+// started last was started by another subagent, so it has no row of its own.
+test('the status bar’s press on a nested subagent opens the row it sits under, the nested one selected', async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'traj-home-')))
+  const work = realpathSync(mkdtempSync(join(tmpdir(), 'traj-ws-')))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = home
+  const worker = await (async () => {
+    const dir = join(home, 'projects', projectDirName(work))
+    const sub = join(dir, S1, 'subagents')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(join(dir, `${S1}.jsonl`), jsonl(backgroundSession().map((l) => ({ ...(l as object), cwd: work }))))
+    // The top-level subagent starts the inner one in the background.
+    const side = (lines: object[]) => jsonl(lines.map((l) => ({ ...l, isSidechain: true })))
+    writeFileSync(join(sub, 'agent-a1b2c3.meta.json'), JSON.stringify(subagentMeta('toolu_bg', 'Map the parser')))
+    writeFileSync(join(sub, 'agent-a1b2c3.jsonl'), side([
+      assistant(3000, 'inner-request', [toolUse('toolu_inner', 'Agent', { description: 'Map the lexer', subagent_type: 'Explore', run_in_background: true })], undefined, 'tool_use'),
+      backgroundLaunch(3200, 'toolu_inner', 'd4e5f6')
+    ]))
+    writeFileSync(join(sub, 'agent-d4e5f6.meta.json'), JSON.stringify(subagentMeta('toolu_inner', 'Map the lexer')))
+    writeFileSync(join(sub, 'agent-d4e5f6.jsonl'), side([]))
+    // The outer one started a minute before the inner one.
+    const before = new Date(Date.now() - 60_000)
+    utimesSync(join(sub, 'agent-a1b2c3.meta.json'), before, before)
+    const workspaces = { workspaces: [{ id: 'ws-1', kind: 'worktree', name: 'app', path: work, branch: 'main', hostId: 'local' }], truncated: false }
+    return mountWorker(main, { host: mockHost({ results: { 'workspace.list': workspaces, 'workspace.readContext': { branch: 'main', displayName: 'app', terminals: [] } } }) })
+  })()
+  try {
+    for (let i = 0; i < 250 && !worker.host.callsOf('statusBar.update').length; i++) await new Promise((r) => setTimeout(r, 20))
+    assert.equal((worker.host.callsOf('statusBar.update')[0] as { text?: string })?.text, '2 subagents running')
+    view = await mount(panel, {
+      host: mockHost({ capabilities: ['workspace:read', 'agent:read'], requests: { 'trajectory.get': (input) => worker.request('trajectory.get', input) } }),
+      persisted: { plugin: { showSubcalls: false } }
+    })
+    await view.settled()
+    await worker.command('showRunningSubagent')
+    await view.post('trajectory.reveal', { sessionId: S1 })
+    await view.settled()
+    assert.ok(view.expandedOf({ label: 'Trajectory rows' }).includes('ctoolu_bg'))
+    assert.equal(view.valueOf({ label: 'Trajectory rows' }), 'stoolu_bg/toolu_inner')
+    assert.ok(drawn('TOOL  Agent'))
+    assert.deepEqual(view.errors, [])
+    assert.deepEqual(view.refusals, [])
+  } finally {
+    await worker.deactivate()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    rmSync(home, { recursive: true, force: true })
+    rmSync(work, { recursive: true, force: true })
+  }
 })
 
 const options = (): string[] => (view!.find({ label: 'Workspace' })!.props.options as { label: string }[]).map((o) => o.label)

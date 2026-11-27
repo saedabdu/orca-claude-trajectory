@@ -105,7 +105,9 @@ async function refresh(): Promise<void> {
 
 // Shows the row of an Agent call: its session stays picked, its turn, request
 // and row open, the row selected so its details show. Calls must be shown for
-// the row to be there.
+// the row to be there. An agent another subagent started has no row of its
+// own: its call sits among the subcalls of the main-loop Agent call that led
+// to it, so that row opens and the subcall is the one selected.
 function reveal(got: TrajectoryAnswer, callId: string): void {
   set(revealing, null)
   set(choice, { workspaceId: got.workspaceId, sessionId: got.sessionId })
@@ -113,14 +115,18 @@ function reveal(got: TrajectoryAnswer, callId: string): void {
   if (!t) return
   const keys = turnKeys(t)
   const sKeys = stepKeys(t)
-  t.turns.forEach((turn, i) => {
-    for (const s of turn.steps) {
-      if (!s.calls.some((c) => c.id === callId)) continue
-      set(showCalls, true)
-      update(expanded, (cur) => [...new Set([...(cur ?? defaultOpen(t)), keys[i], sKeys.get(s)!, `c${callId}`])])
-      set(selected, `c${callId}`)
-    }
-  })
+  const at = (find: (c: Call) => boolean): { i: number; s: Step; c: Call } | null => {
+    for (const [i, turn] of t.turns.entries()) for (const s of turn.steps) for (const c of s.calls) if (find(c)) return { i, s, c }
+    return null
+  }
+  const own = at((c) => c.id === callId)
+  const found = own ?? at((c) => c.sub.some((sc) => sc.id === callId))
+  if (!found) return
+  const { i, s, c } = found
+  set(showCalls, true)
+  if (!own) set(showSubcalls, true)
+  update(expanded, (cur) => [...new Set([...(cur ?? defaultOpen(t)), keys[i], sKeys.get(s)!, `c${c.id}`])])
+  set(selected, own ? `c${c.id}` : `s${c.id}/${callId}`)
 }
 
 export function setup(ctx: PanelContext): void {

@@ -90,13 +90,14 @@ export function fit(answer: TrajectoryAnswer): TrajectoryAnswer {
 type Running = { workspaceId: string; workspace: string; sessionId: string; title: string; agents: LiveSubagent[] }
 
 // Every local session written lately that has a subagent running, from the meta files only.
+// Each one written in the window, not the picker's newest few: a workspace busy
+// with many short sessions can have its running subagent in an older one.
 async function runningNow(orca: OrcaWorkerApi, home: string, now: number): Promise<Running[]> {
   const out: Running[] = []
   const seen = new Set<string>() // two workspaces can share a folder
   for (const w of await localWorkspaces(orca)) {
-    const { root, sessions } = await listSessions(home, w.path)
+    const { root, sessions } = await listSessions(home, w.path, { since: now - STATUS.recentMs })
     for (const s of sessions) {
-      if (now - s.updatedAt >= STATUS.recentMs) break // newest first
       if (seen.has(s.id)) continue
       seen.add(s.id)
       const agents = await liveSubagents(root, s.dir, s.id, now)
@@ -276,7 +277,9 @@ export default function activate(orca: OrcaWorkerApi): void {
       return { ...answer, notice: 'Pick a workspace on this machine to see its Claude Code sessions.' }
     }
 
-    const { root, sessions } = await listSessions(home, ws.path)
+    // The session asked for is listed even when older than the picker's newest:
+    // the status bar can point at one, and the panel then keeps asking for it.
+    const { root, sessions } = await listSessions(home, ws.path, { also: wantSession })
     answer.sessions = sessions.map(({ id, title, updatedAt }) => ({ id, title, updatedAt }))
     // Only a session found in that workspace's folder: the id picks one, it is never a path.
     const session = (wantSession ? sessions.find((s) => s.id === wantSession) : null) ?? sessions[0] ?? null
