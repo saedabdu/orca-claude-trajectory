@@ -1,7 +1,7 @@
 // `orca plugin check` renders the panel once per scenario, with the worker stubbed by `requests`.
 import { defineCheck } from 'orca/testing'
 import { build, parseLines } from './transcript.ts'
-import { basicSession, jsonl, showcaseSession, showcaseSubagent, T0, withShape } from './fixtures.ts'
+import { backgroundSession, basicSession, jsonl, showcaseSession, showcaseSubagent, T0, withShape } from './fixtures.ts'
 import type { TrajectoryAnswer } from './protocol.ts'
 
 const base: TrajectoryAnswer = {
@@ -25,6 +25,8 @@ export default defineCheck({
   session: { requests: { 'trajectory.get': () => base } },
   showcase: { requests: { 'trajectory.get': () => showcase } },
   'no calls': { requests: { 'trajectory.get': () => base }, persisted: { plugin: { showCalls: false } } },
+  // A background subagent still running, its row opened as the status bar's press opens it.
+  subagent: { requests: { 'trajectory.get': () => ({ ...base, data: build(parseLines(jsonl(backgroundSession())), [], true, T0 + 60_000), reveal: 'toolu_bg' }) } },
   breakdown: { requests: { 'trajectory.get': () => ({ ...base, data: build(parseLines(jsonl(withShape())), [], true, T0 + 86_400_000) }) } },
   empty: { requests: { 'trajectory.get': () => ({ ...base, sessions: [], sessionId: null, data: null, notice: 'No Claude Code sessions in this workspace yet.' }) } }
 })

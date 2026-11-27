@@ -4,7 +4,8 @@
 // where <dir> is the working directory with every character other than a
 // letter or digit turned into "-" (cut at 200 characters with a hash after it
 // when longer). A subagent's transcript is `<session-id>/subagents/agent-<id>.jsonl`
-// with a `.meta.json` beside it naming the Agent call that started it.
+// with a `.meta.json` beside it naming the Agent call that started it, which
+// gains `"finished": true` when the subagent stops.
 //
 // Every path built here stays inside the projects folder: names are matched
 // against strict patterns before they are joined, symbolic links are refused,
@@ -17,6 +18,7 @@ import { isAbsolute, join, resolve, sep } from 'node:path'
 import { cwdOf, LIMITS, parseLines, tallyTurns, titleOf, type Rec, type Subagent, type TurnTally } from './transcript.ts'
 import { isAgentTool } from './format.ts'
 import type { SessionInfo } from './protocol.ts'
+import { preview } from './redact.ts'
 
 export const CAPS = {
   transcriptBytes: 32 * 1024 * 1024, // the newest part of a session read
@@ -25,7 +27,8 @@ export const CAPS = {
   metaBytes: 16 * 1024,
   headBytes: 64 * 1024, // read to learn a session's working directory
   sessions: 20, // newest sessions listed per workspace
-  subagents: 50 // newest subagent transcripts read per session
+  subagents: 50, // newest subagent transcripts read per session
+  quietMs: 10 * 60_000 // a subagent with no end whose transcript is silent this long has no news
 }
 
 export const SESSION_FILE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/
@@ -170,11 +173,19 @@ async function sessionHead(file: string, size: number, mtime: number): Promise<{
 }
 
 /**
+ * What a listing reaches past the newest `CAPS.sessions`. `since`: every
+ * session written after that time instead, however many, so the status bar
+ * misses no running subagent. `also`: that session too, wherever it sorts,
+ * so a session the status bar was pressed for still opens when it is older.
+ */
+export type Reach = { since?: number; also?: string | null }
+
+/**
  * A workspace's sessions, newest first. A session is listed only when its
  * transcript says it ran in `cwd`; one too new to say is listed when its
  * folder's name matches exactly (two working directories can share a name).
  */
-export async function listSessions(home: string, cwd: string): Promise<{ root: string; sessions: Found[] }> {
+export async function listSessions(home: string, cwd: string, reach: Reach = {}): Promise<{ root: string; sessions: Found[] }> {
   const found = await projectDirs(home, cwd)
   if (!found) return { root: '', sessions: [] }
   const { root, dirs } = found
@@ -196,13 +207,33 @@ export async function listSessions(home: string, cwd: string): Promise<{ root: s
     }
   }
   candidates.sort((a, b) => b.mtime - a.mtime)
-  const sessions: Found[] = []
-  for (const c of candidates.slice(0, CAPS.sessions * 3)) {
-    if (sessions.length >= CAPS.sessions) break
+  const listed = async (c: (typeof candidates)[number]): Promise<Found | null> => {
     const head = await sessionHead(c.file, c.size, c.mtime)
-    if (!head) continue
-    if (head.cwd ? head.cwd !== cwd && head.cwd !== realCwd : !c.exact) continue
-    sessions.push({ id: c.id, title: head.title ?? 'Untitled session', updatedAt: Math.round(c.mtime), file: c.file, dir: c.dir })
+    if (!head) return null
+    if (head.cwd ? head.cwd !== cwd && head.cwd !== realCwd : !c.exact) return null
+    return { id: c.id, title: head.title ?? 'Untitled session', updatedAt: Math.round(c.mtime), file: c.file, dir: c.dir }
+  }
+  const { since, also } = reach
+  const sessions: Found[] = []
+  if (since != null) {
+    for (const c of candidates) {
+      if (c.mtime <= since) break // newest first: the rest are older
+      const s = await listed(c)
+      if (s) sessions.push(s)
+    }
+  } else {
+    for (const c of candidates.slice(0, CAPS.sessions * 3)) {
+      if (sessions.length >= CAPS.sessions) break
+      const s = await listed(c)
+      if (s) sessions.push(s)
+    }
+  }
+  if (also && !sessions.some((s) => s.id === also)) {
+    const c = candidates.find((x) => x.id === also)
+    const s = c ? await listed(c) : null
+    // In its place by time, so the list stays newest first.
+    const at = s ? sessions.findIndex((x) => x.updatedAt < s.updatedAt) : -1
+    if (s) sessions.splice(at < 0 ? sessions.length : at, 0, s)
   }
   return { root, sessions }
 }
@@ -212,39 +243,12 @@ export async function readSubagents(root: string, dir: string, sessionId: string
   if (!SESSION_ID.test(sessionId)) return []
   const sub = await safeEntry(root, join(dir, sessionId, 'subagents'), 'dir')
   if (!sub) return []
-  let names: string[] = []
-  try {
-    names = (await fs.readdir(sub)).filter((n) => AGENT_META.test(n))
-  } catch {
-    return []
-  }
-  const metas: { meta: string; jsonl: string; mtime: number; size: number }[] = []
-  for (const n of names) {
-    const meta = await safeEntry(root, join(sub, n), 'file')
-    const jsonl = await safeEntry(root, join(sub, n.replace(/\.meta\.json$/, '.jsonl')), 'file')
-    if (!meta || !jsonl) continue
-    const st = await fs.stat(jsonl).catch(() => null)
-    if (st) metas.push({ meta, jsonl, mtime: st.mtimeMs, size: st.size })
-  }
-  metas.sort((a, b) => b.mtime - a.mtime)
+  const metas = (await subagentFiles(root, sub)).slice(0, CAPS.subagents)
   // What each file says started it, whether or not it turns out to be wanted.
-  const started: { m: (typeof metas)[number]; toolUseId: string; agentType: string | null }[] = []
-  for (const m of metas.slice(0, CAPS.subagents)) {
-    try {
-      let said = metasRead.get(m.meta)
-      if (!said) {
-        const meta: unknown = JSON.parse((await readCapped(m.meta, CAPS.metaBytes, 'start')).text)
-        if (typeof meta !== 'object' || meta === null) continue
-        const { toolUseId, agentType } = meta as Record<string, unknown>
-        if (typeof toolUseId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(toolUseId)) continue
-        said = { toolUseId, agentType: typeof agentType === 'string' && /^[A-Za-z0-9_:.-]{1,60}$/.test(agentType) ? agentType : null }
-        metasRead.set(m.meta, said)
-        if (metasRead.size > CAPS.subagents * 4) metasRead.delete(metasRead.keys().next().value!)
-      }
-      started.push({ m, ...said })
-    } catch {
-      /* an unreadable subagent is left out */
-    }
+  const started: { m: SubagentFile; toolUseId: string; agentType: string | null; finished: boolean }[] = []
+  for (const m of metas) {
+    const said = await readMeta(m.meta)
+    if (said) started.push({ m, ...said })
   }
   // Agents the main loop started, then any those started: an Agent call can sit in a subagent's own file.
   const wanted = new Set(mainCalls)
@@ -258,7 +262,7 @@ export async function readSubagents(root: string, dir: string, sessionId: string
       grew = true
       try {
         const agent = await readAgent(s.m, s.toolUseId, s.agentType)
-        out.push(agent)
+        out.push({ ...agent, finished: s.finished, writtenAt: Math.round(s.m.mtime) })
         for (const r of agent.records) if (r.k === 'asst') for (const t of r.tools) if (isAgentTool(t.tool)) wanted.add(t.id)
       } catch {
         /* an unreadable subagent is left out */
@@ -280,8 +284,82 @@ async function readAgent(m: { jsonl: string; mtime: number; size: number }, tool
   return agent
 }
 
-// What a subagent's meta file says started it, which doesn't change once written.
-const metasRead = new Map<string, { toolUseId: string; agentType: string | null }>()
+// ---------------------------------------------------------------- subagent meta files
+
+type SubagentFile = { meta: string; jsonl: string; mtime: number; size: number; startedAt: number }
+type Meta = { toolUseId: string; agentType: string | null; description: string; finished: boolean }
+
+// A session's subagent files, the transcript most recently written first.
+async function subagentFiles(root: string, sub: string): Promise<SubagentFile[]> {
+  let names: string[] = []
+  try {
+    names = (await fs.readdir(sub)).filter((n) => AGENT_META.test(n))
+  } catch {
+    return []
+  }
+  const out: SubagentFile[] = []
+  for (const n of names) {
+    const meta = await safeEntry(root, join(sub, n), 'file')
+    const jsonl = await safeEntry(root, join(sub, n.replace(/\.meta\.json$/, '.jsonl')), 'file')
+    if (!meta || !jsonl) continue
+    const st = await fs.stat(jsonl).catch(() => null)
+    const mst = await fs.stat(meta).catch(() => null)
+    // The meta file is written as the subagent starts, and again only as it finishes.
+    const born = mst ? (mst.birthtimeMs > 0 ? Math.min(mst.birthtimeMs, mst.mtimeMs) : mst.mtimeMs) : 0
+    if (st) out.push({ meta, jsonl, mtime: st.mtimeMs, size: st.size, startedAt: Math.round(born || st.birthtimeMs || st.mtimeMs) })
+  }
+  return out.sort((a, b) => b.mtime - a.mtime)
+}
+
+// What a meta file says, read again only when it changed: `finished` is added at the end.
+async function readMeta(path: string): Promise<Meta | null> {
+  try {
+    const st = await fs.stat(path)
+    const key = `${st.mtimeMs}:${st.size}`
+    const hit = metasRead.get(path)
+    if (hit?.key === key) return hit.meta
+    const raw: unknown = JSON.parse((await readCapped(path, CAPS.metaBytes, 'start')).text)
+    if (typeof raw !== 'object' || raw === null) return null
+    const { toolUseId, agentType, description, finished } = raw as Record<string, unknown>
+    if (typeof toolUseId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(toolUseId)) return null
+    const meta: Meta = {
+      toolUseId,
+      agentType: typeof agentType === 'string' && /^[A-Za-z0-9_:.-]{1,60}$/.test(agentType) ? agentType : null,
+      description: preview(description, 80),
+      finished: finished === true
+    }
+    metasRead.delete(path)
+    metasRead.set(path, { key, meta })
+    if (metasRead.size > CAPS.subagents * 4) metasRead.delete(metasRead.keys().next().value!)
+    return meta
+  } catch {
+    return null // an unreadable subagent is left out
+  }
+}
+
+/** A subagent still running: its type, what it was asked, and when it started. */
+export type LiveSubagent = { toolUseId: string; agentType: string | null; description: string; startedAt: number }
+
+/**
+ * A session's running subagents, from their meta files alone: no `finished`
+ * yet, and the transcript written in the last `CAPS.quietMs`. Reads no
+ * transcript, so it is cheap enough to run for every recent session.
+ */
+export async function liveSubagents(root: string, dir: string, sessionId: string, now: number): Promise<LiveSubagent[]> {
+  if (!SESSION_ID.test(sessionId)) return []
+  const sub = await safeEntry(root, join(dir, sessionId, 'subagents'), 'dir')
+  if (!sub) return []
+  const out: LiveSubagent[] = []
+  for (const m of (await subagentFiles(root, sub)).slice(0, CAPS.subagents)) {
+    if (now - m.mtime >= CAPS.quietMs) break // newest first: the rest are as silent
+    const meta = await readMeta(m.meta)
+    if (meta && !meta.finished) out.push({ toolUseId: meta.toolUseId, agentType: meta.agentType, description: meta.description, startedAt: m.startedAt })
+  }
+  return out.sort((a, b) => a.startedAt - b.startedAt)
+}
+
+// What each meta file said, by file, time and size.
+const metasRead = new Map<string, { key: string; meta: Meta }>()
 
 // Subagent transcripts already read, by file, size and time.
 const agents = new Map<string, { key: string; agent: Subagent }>()
